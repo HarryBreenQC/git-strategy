@@ -1,0 +1,126 @@
+name: Rolling release candidate
+
+on:
+  push:
+    branches: [preprod, prod]
+  pull_request_target:
+    types: [ready_for_review, closed, reopened]
+    branches: [prod]
+  workflow_dispatch:
+
+concurrency:
+  group: rolling-release-candidate
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  reconcile:
+    # Ignore ordinary PRs and fork branches that happen to use the same prefix.
+    if: >-
+      github.event_name != 'pull_request_target' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       startsWith(github.event.pull_request.head.ref, 'release-candidate/'))
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PREPROD: preprod
+      PROD: prod
+      PREFIX: release-candidate/
+      ROLLING_LABEL: release-candidate:rolling
+      LOCKED_LABEL: release-candidate:locked
+      EVENT_ACTION: ${{ github.event.action || '' }}
+      EVENT_PR: ${{ github.event.pull_request.number || '' }}
+      EVENT_HEAD: ${{ github.event.pull_request.head.ref || '' }}
+      EVENT_SHA: ${{ github.event.pull_request.head.sha || '' }}
+    steps:
+      - name: Reconcile release candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh label create "$ROLLING_LABEL" --repo "$GITHUB_REPOSITORY" \
+            --color 1D76DB --description "Draft candidate following preprod" --force
+          gh label create "$LOCKED_LABEL" --repo "$GITHUB_REPOSITORY" \
+            --color B60205 --description "Candidate frozen by Ready for review" --force
+
+          # Ready for review is a one-way lock. The event SHA is the exact commit
+          # that was visible when the button was clicked.
+          if [[ "$EVENT_ACTION" == "ready_for_review" ]]; then
+            gh api --method PATCH \
+              "repos/$GITHUB_REPOSITORY/git/refs/heads/$EVENT_HEAD" \
+              -f sha="$EVENT_SHA" -F force=true >/dev/null
+            gh pr edit "$EVENT_PR" --repo "$GITHUB_REPOSITORY" \
+              --remove-label "$ROLLING_LABEL" --add-label "$LOCKED_LABEL" \
+              --title "Release candidate #$EVENT_PR (locked)"
+            gh pr comment "$EVENT_PR" --repo "$GITHUB_REPOSITORY" \
+              --body "Frozen at \`$EVENT_SHA\`. Later commits go to the next draft."
+          fi
+
+          # Bootstrap is intentionally quiet until both long-lived branches exist.
+          if ! PREPROD_SHA=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$PREPROD" --jq .object.sha 2>/dev/null) ||
+             ! PROD_SHA=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$PROD" --jq .object.sha 2>/dev/null); then
+            echo "Waiting for both $PREPROD and $PROD."
+            exit 0
+          fi
+
+          AHEAD=$(gh api "repos/$GITHUB_REPOSITORY/compare/$PROD...$PREPROD" --jq .ahead_by)
+          ROLLING=$(gh pr list --repo "$GITHUB_REPOSITORY" --base "$PROD" \
+            --state open --label "$ROLLING_LABEL" \
+            --json number,isDraft,headRefName,headRefOid \
+            --jq "[.[] | select(.headRefName | startswith(\"$PREFIX\"))][0] // empty")
+
+          # Recover safely if the Ready event was missed: a non-draft candidate
+          # carrying the rolling label is already locked and must never move.
+          if [[ -n "$ROLLING" && $(jq -r .isDraft <<<"$ROLLING") != "true" ]]; then
+            LOCKED_PR=$(jq -r .number <<<"$ROLLING")
+            gh pr edit "$LOCKED_PR" --repo "$GITHUB_REPOSITORY" \
+              --remove-label "$ROLLING_LABEL" --add-label "$LOCKED_LABEL" \
+              --title "Release candidate #$LOCKED_PR (locked)"
+            ROLLING=""
+          fi
+
+          # No unreleased commits means there should be no rolling draft.
+          if [[ "$AHEAD" == "0" ]]; then
+            if [[ -n "$ROLLING" ]]; then
+              PR=$(jq -r .number <<<"$ROLLING")
+              gh pr close "$PR" --repo "$GITHUB_REPOSITORY" --delete-branch \
+                --comment "Closing because prod already contains every preprod commit."
+            fi
+            exit 0
+          fi
+
+          # Move the existing draft snapshot to the latest preprod commit.
+          if [[ -n "$ROLLING" ]]; then
+            PR=$(jq -r .number <<<"$ROLLING")
+            BRANCH=$(jq -r .headRefName <<<"$ROLLING")
+            OLD_SHA=$(jq -r .headRefOid <<<"$ROLLING")
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/$BRANCH" \
+              -f sha="$PREPROD_SHA" -F force=true >/dev/null
+
+            # If it became ready during the update, put the old snapshot back.
+            if [[ $(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft) != "true" ]]; then
+              gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/$BRANCH" \
+                -f sha="$OLD_SHA" -F force=true >/dev/null
+            fi
+            exit 0
+          fi
+
+          # No rolling draft exists, so start one at the current preprod SHA.
+          BRANCH="$PREFIX${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/heads/$BRANCH" -f sha="$PREPROD_SHA" >/dev/null
+          BODY=$(printf '%s\n' \
+            'This draft contains every commit in `preprod` that is not in `prod`.' \
+            '' \
+            '**Ready for review is the lock button.** Once clicked, this snapshot never moves again.' \
+            '' \
+            '> This PR and its branch are owned by automation.')
+          URL=$(gh pr create --repo "$GITHUB_REPOSITORY" --draft --base "$PROD" \
+            --head "$BRANCH" --title "Release candidate (rolling)" --body "$BODY")
+          PR=${URL##*/}
+          gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" \
+            --add-label "$ROLLING_LABEL" --title "Release candidate #$PR (rolling)"
